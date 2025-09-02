@@ -1,0 +1,213 @@
+// Include required libraries
+#include <WiFi.h>          // For connecting ESP32 to WiFi network
+#include <WebServer.h>     // For creating a local web server on ESP32
+#include <HTTPClient.h>    // For making HTTP requests to external APIs
+#include <ArduinoJson.h>   // For parsing JSON responses (from weather API)
+#include "DHT.h"           // For DHT sensor (temperature & humidity)
+
+// ---------------- WiFi Credentials -----------------
+const char* ssid = "SSIT";       // WiFi SSID (network name)
+const char* password = "SSIT@504"; // WiFi password
+
+// ---------------- Weather API Settings -----------------
+String API_KEY = "9aa6a18948ee9613d37b7c92a8a3bb30";  // OpenWeatherMap API key
+String LAT = "16.5062";          // Latitude (Vijayawada)
+String LON = "80.6480";          // Longitude (Vijayawada)
+String UNITS = "metric";         // Units of measurement ("metric" = Celsius)
+
+// ---------------- Sensor Pins -----------------
+#define DHTPIN 4                 // Pin connected to DHT11 sensor
+#define DHTTYPE DHT11            // Type of DHT sensor
+#define RAIN_SENSOR_PIN 34       // Pin connected to rain sensor (analog)
+
+// Initialize DHT sensor object
+DHT dht(DHTPIN, DHTTYPE);
+
+// Create web server instance running on port 80
+WebServer server(80);
+
+// ---------------- Variables for Weather Data -----------------
+String currentDescription = "";   // Stores current weather description (e.g. "clear sky")
+float currentTemp = 0;            // Stores current temperature
+String weatherHTML = "";          // Stores dynamically generated HTML web page
+
+// Structure to hold forecast data (temperature, description, icon)
+struct ForecastData {
+  float temp;
+  String description;
+  String icon;
+};
+
+// Array to hold forecast for 6 days
+ForecastData forecast[6];
+
+// ---------------------------------------------------------------
+// Function: Fetch Weather Data from OpenWeatherMap API
+// ---------------------------------------------------------------
+void fetchWeatherData() {
+  // Ensure ESP32 is connected to WiFi before making HTTP requests
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  // Construct API URL with latitude, longitude, units, and API key
+  String url = "http://api.openweathermap.org/data/2.5/forecast?lat=" 
+               + String(LAT) + "&lon=" + String(LON) 
+               + "&units=" + UNITS + "&appid=" + API_KEY;
+
+  http.begin(url);          // Begin HTTP request
+  int httpCode = http.GET(); // Perform GET request
+
+  if (httpCode == 200) {   // If response is OK
+    String payload = http.getString(); // Get full JSON payload
+    Serial.println("API Payload:\n" + payload);
+
+    // Use large JSON buffer for forecast data
+    StaticJsonDocument<16384> doc; 
+    DeserializationError err = deserializeJson(doc, payload);
+
+    if (!err) { // If JSON parsing successful
+      JsonArray list = doc["list"]; // Access forecast list (3-hourly data)
+
+      // Extract current weather details
+      currentTemp = list[0]["main"]["temp"].as<float>();
+      currentDescription = list[0]["weather"][0]["description"].as<String>();
+
+      // Extract forecast for next 6 days (every 8th entry = ~24h gap)
+      for (int i = 0; i < 6; i++) {
+        forecast[i].temp = list[i * 8]["main"]["temp"].as<float>();  
+        forecast[i].description = list[i * 8]["weather"][0]["description"].as<String>();
+        forecast[i].icon = list[i * 8]["weather"][0]["icon"].as<String>();
+      }
+    } else {
+      Serial.print("JSON Deserialization failed: ");
+      Serial.println(err.c_str());
+    }
+  } else {
+    Serial.println("HTTP Error: " + String(httpCode)); // Error if request fails
+  }
+
+  http.end(); // Close HTTP connection
+}
+
+// ---------------------------------------------------------------
+// Function: Map Weather Icon Codes to Emoji Symbols
+// ---------------------------------------------------------------
+String getWeatherIcon(String code) {
+  if (code.indexOf("01") >= 0) return "☀";    // Clear sky
+  if (code.indexOf("02") >= 0) return "🌤";    // Few clouds
+  if (code.indexOf("03") >= 0) return "☁";     // Scattered clouds
+  if (code.indexOf("04") >= 0) return "🌥";    // Broken clouds
+  if (code.indexOf("09") >= 0) return "🌧";    // Shower rain
+  if (code.indexOf("10") >= 0) return "🌦";    // Rain
+  if (code.indexOf("11") >= 0) return "⛈";    // Thunderstorm
+  if (code.indexOf("13") >= 0) return "❄";     // Snow
+  if (code.indexOf("50") >= 0) return "🌫";    // Mist
+  return "❓";                                  // Unknown code
+}
+
+// ---------------------------------------------------------------
+// Function: Get Day of Week from Current Date + Offset
+// ---------------------------------------------------------------
+String getDayOfWeek(int dayOffset) {
+  time_t now = time(nullptr) + dayOffset * 86400; // Add days in seconds
+  struct tm* timeInfo = localtime(&now);
+  char buffer[10];
+  strftime(buffer, sizeof(buffer), "%a", timeInfo); // Format as short weekday name (Mon, Tue…)
+  return String(buffer);
+}
+
+// ---------------------------------------------------------------
+// Function: Generate HTML Web Page for Weather Display
+// ---------------------------------------------------------------
+void generateWebPage() {
+  // Read local DHT11 sensor values
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  // If invalid reading, set default 0
+  if (isnan(temperature) || isnan(humidity)) {
+    temperature = 0;
+    humidity = 0;
+  }
+
+  // Read rain sensor analog value
+  int rainValue = analogRead(RAIN_SENSOR_PIN);
+  String rainStatus = rainValue < 1000 ? "🌧 Rain Detected" : "☀ No Rain";
+
+  // Start building HTML content
+  weatherHTML = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  weatherHTML += "<title>Vijayawada Weather</title><style>";
+  weatherHTML += "body{font-family:sans-serif;background:#eef;padding:20px;text-align:center}";
+  weatherHTML += ".card{background:#fff;margin:10px auto;padding:15px;border-radius:12px;box-shadow:0 4px 8px rgba(0,0,0,0.1);max-width:300px}";
+  weatherHTML += "h2{margin-bottom:5px;}p{margin:5px;font-size:16px}";
+  weatherHTML += "</style></head><body>";
+  weatherHTML += "<h1>🌤 Vijayawada Weather Station</h1>";
+
+  // Current weather card
+  weatherHTML += "<div class='card'><h2>Current</h2>";
+  weatherHTML += "<p>🌡 Temp: " + String(currentTemp) + " °C</p>";
+  weatherHTML += "<p>📝 Desc: " + currentDescription + "</p>";
+  weatherHTML += "<p>💧 Humidity: " + String(humidity) + " %</p>";
+  weatherHTML += "<p>" + rainStatus + "</p></div>";
+
+  // 5-day forecast cards
+  for (int i = 0; i < 5; i++) {
+    weatherHTML += "<div class='card'>";
+    weatherHTML += "<h2>" + getDayOfWeek(i) + "</h2>";
+    weatherHTML += "<p>" + getWeatherIcon(forecast[i].icon) + "</p>";
+    weatherHTML += "<p>" + forecast[i].description + "</p>";
+    weatherHTML += "<p>" + String(forecast[i].temp) + " °C</p>";
+    weatherHTML += "</div>";
+  }
+
+  weatherHTML += "</body></html>";
+}
+
+// ---------------------------------------------------------------
+// Function: Handle Root URL Request
+// ---------------------------------------------------------------
+void handleRoot() {
+  generateWebPage();                          // Generate new HTML content
+  server.send(200, "text/html", weatherHTML); // Send webpage to client
+}
+
+// ---------------------------------------------------------------
+// Setup Function: Runs Once at Startup
+// ---------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);         // Start Serial monitor for debugging
+  dht.begin();                  // Initialize DHT sensor
+  pinMode(RAIN_SENSOR_PIN, INPUT); // Set rain sensor pin as input
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); 
+    Serial.print(".");
+  }
+  Serial.println("Connected! IP: " + WiFi.localIP().toString());
+
+  // Configure NTP for time (for weekday names)
+  configTime(19800, 0, "pool.ntp.org"); // 19800 sec = +5:30 GMT offset for IST
+
+  fetchWeatherData(); // Fetch initial weather data
+
+  // Register URL handlers for the web server
+  server.on("/", handleRoot); 
+  server.begin(); // Start web server
+}
+
+// ---------------------------------------------------------------
+// Loop Function: Runs Continuously
+// ---------------------------------------------------------------
+unsigned long lastFetch = 0; // Store last time data was fetched
+void loop() {
+  server.handleClient(); // Handle incoming HTTP requests
+
+  // Refresh weather data every 1 hour (3600000 ms)
+  if (millis() - lastFetch > 3600000) {  
+    fetchWeatherData();
+    lastFetch = millis();
+  }
+}
